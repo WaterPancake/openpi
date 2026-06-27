@@ -16,6 +16,16 @@ import openpi.shared.nnx_utils as nnx_utils
 
 logger = logging.getLogger("openpi")
 
+# Action-expert hidden-state layers to record for SAFE-style probing.
+#
+# Indices follow the HuggingFace `output_hidden_states` convention applied to the action expert:
+#   index 0  -> the input embeddings (suffix tokens before any transformer block)
+#   index k  -> the residual stream after block k-1 (i.e. the output of the k-th block, 1-indexed)
+# The action expert (and the gemma_2b backbone) has depth=18, so valid indices are 0..18 inclusive.
+# The default below grabs every 3rd layer plus the final (18th) block output. Edit this tuple to probe
+# different layers; the recorded `hidden_states` tensor is ordered to match it.
+SAFE_HIDDEN_LAYERS: tuple[int, ...] = (0, 3, 6, 9, 12, 15, 18)
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -297,6 +307,15 @@ class Pi0(_model.BaseModel):
             dtype=jnp.float32
         )
 
+        # Initialize the accumulator for the selected intermediate action-expert hidden layers.
+        # Shape: (batch, num_steps, num_selected_layers, action_horizon, feature_dim).
+        layer_idx = jnp.asarray(SAFE_HIDDEN_LAYERS)
+        n_hidden_layers = len(SAFE_HIDDEN_LAYERS)
+        hidden_init = jnp.zeros(
+            (batch_size, num_steps, n_hidden_layers, self.action_horizon, feature_dim),
+            dtype=jnp.float32
+        )
+
         # --- 2) carve out one‐trajectory sampler ---
         def one_sample(subkey):
             # initial noise
@@ -304,10 +323,10 @@ class Pi0(_model.BaseModel):
                 subkey,
                 (batch_size, self.action_horizon, self.action_dim)
             )
-            init_state = (x0, 1.0, pre_vel_init, 0)
+            init_state = (x0, 1.0, pre_vel_init, hidden_init, 0)
 
             def step(carry):
-                x_t, time, accum, i = carry
+                x_t, time, accum, hidden_accum, i = carry
                 # embed suffix conditioned on current x_t
                 suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
                     observation,
@@ -324,38 +343,47 @@ class Pi0(_model.BaseModel):
                     + jnp.cumsum(suffix_mask, axis=-1)
                     - 1
                 )
-                # run the model
-                (_, suffix_out), _ = self.PaliGemma.llm(
+                # run the model, also returning per-layer hidden states for the action expert
+                (_, suffix_out), _, all_hidden = self.PaliGemma.llm(
                     [None, suffix_tokens],
                     mask=full_attn,
                     positions=pos,
-                    kv_cache=kv_cache
+                    kv_cache=kv_cache,
+                    return_hidden_states=True,
                 )
-                # record & project
+                # record final-layer (post-norm) feature & project to the velocity field
                 cur_feat = suffix_out[:, -self.action_horizon :]
                 accum = accum.at[:, i].set(cur_feat)
+                # gather the selected intermediate hidden layers for the action (suffix) tokens.
+                # all_hidden[1]: (depth+1, batch, suffix_len, feature_dim) for the action expert.
+                suffix_hidden = all_hidden[1][layer_idx]  # (num_layers, batch, suffix_len, feature_dim)
+                suffix_hidden = suffix_hidden[:, :, -self.action_horizon :, :]  # (num_layers, batch, horizon, feat)
+                suffix_hidden = jnp.transpose(suffix_hidden, (1, 0, 2, 3)).astype(jnp.float32)  # (batch, num_layers, horizon, feat)
+                hidden_accum = hidden_accum.at[:, i].set(suffix_hidden)
                 v_t = self.action_out_proj(cur_feat)
-                return x_t + dt * v_t, time + dt, accum, i + 1
+                return x_t + dt * v_t, time + dt, accum, hidden_accum, i + 1
 
             def cond(carry):
-                _, time, _, _ = carry
+                _, time, _, _, _ = carry
                 return time >= -dt / 2
 
-            final_x, _, final_accum, _ = jax.lax.while_loop(cond, step, init_state)
-            return final_x, final_accum
+            final_x, _, final_accum, final_hidden, _ = jax.lax.while_loop(cond, step, init_state)
+            return final_x, final_accum, final_hidden
 
         # --- 3) vectorize across all samples ---
         keys = jax.random.split(rng, n_action_samples)
-        xs, pre_vs = jax.vmap(one_sample)(keys)
-        # xs:   (n_action_samples, batch_size, horizon, action_dim)
-        # pre_vs:(n_action_samples, batch_size, num_steps, horizon, feature_dim)
+        xs, pre_vs, hidden_vs = jax.vmap(one_sample)(keys)
+        # xs:      (n_action_samples, batch_size, horizon, action_dim)
+        # pre_vs:  (n_action_samples, batch_size, num_steps, horizon, feature_dim)
+        # hidden_vs:(n_action_samples, batch_size, num_steps, num_layers, horizon, feature_dim)
 
         # --- 4) drop batch‐axis if batch_size==1 to get (n, horizon, dim), etc ---
         if batch_size == 1:
             xs    = xs.squeeze(1)    # -> (n_action_samples, action_horizon, action_dim)
             pre_vs = pre_vs.squeeze(1)  # -> (n_action_samples, num_steps, action_horizon, feature_dim)
+            hidden_vs = hidden_vs.squeeze(1)  # -> (n_action_samples, num_steps, num_layers, action_horizon, feature_dim)
 
-        aux_accum = {"pre_velocity": pre_vs}
+        aux_accum = {"pre_velocity": pre_vs, "hidden_states": hidden_vs}
         return xs, aux_accum
 
 

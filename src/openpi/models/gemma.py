@@ -282,7 +282,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, decode, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, decode, return_hidden_states=False, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -319,6 +319,11 @@ class Block(nn.Module):
         xs = jax.tree.map(lambda x, y: x + y, xs, out)
         xs = sharding.activation_sharding_constraint(xs)
 
+        if return_hidden_states:
+            # Emit the post-block residual stream (per expert) as an extra scan output so that callers
+            # can recover the intermediate hidden states, stacked along the layer axis. `xs` is still the
+            # scan carry; the copy in the second return is what gets stacked over `depth`.
+            return xs, (kv_cache, xs)
         return xs, kv_cache
 
 
@@ -347,14 +352,15 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 5=deterministic
+            static_argnums=(5, 6),  # 0=self, 5=decode, 6=return_hidden_states (both control tracing/output structure)
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},
             split_rngs={"params": True, "dropout": True},
-            in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache, 1=positions, 2=mask, 3=decode
+            # 0=kv_cache, 1=positions, 2=mask, 3=decode, 4=return_hidden_states
+            in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -377,15 +383,41 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_hidden_states: bool = False,
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[
+            Sequence[at.Float[at.Array, "b _t _d"] | None],
+            KVCache,
+            Sequence[at.Float[at.Array, "..."] | None],
+        ]
+    ):
+        # Keep the input embeddings around so they can be exposed as hidden-state index 0, matching the
+        # HuggingFace `output_hidden_states` convention (index 0 = embeddings, index k = output of block k-1).
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, deterministic)
+        if return_hidden_states:
+            new_embedded, (kv_cache, layer_outputs) = self.layers(
+                embedded, kv_cache, positions, mask, deterministic, True
+            )
+        else:
+            new_embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, deterministic, False)
 
-        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
+        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in new_embedded if e is not None)
 
-        return [f(e) if e is not None else e for f, e in zip(self.final_norms, embedded, strict=True)], kv_cache
+        outputs = [f(e) if e is not None else e for f, e in zip(self.final_norms, new_embedded, strict=True)]
+
+        if not return_hidden_states:
+            return outputs, kv_cache
+
+        # Stack the input embeddings (index 0) with every per-block residual stream (indices 1..depth) along a
+        # new leading layer axis, giving `depth + 1` hidden states per expert (None for experts that didn't run).
+        hidden_states = [
+            None if e_in is None else jnp.concatenate([e_in[None], lo], axis=0)
+            for e_in, lo in zip(embedded, layer_outputs, strict=True)
+        ]
+        return outputs, kv_cache, hidden_states
 
     def init(self):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
