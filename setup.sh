@@ -189,7 +189,17 @@ else
     uv venv --python 3.8 "${LIBERO_VENV}"
 fi
 
-# uv pip sync into the LIBERO venv (note: --python targets that venv explicitly,
+# CRITICAL: LIBERO's repo is missing this top-level __init__.py. Without it,
+# find_packages() in its setup.py discovers no `libero` package and the editable
+# install registers nothing — `import libero` then fails. find_packages() runs at
+# INSTALL time, so this MUST be created BEFORE `uv pip install -e` below.
+if [[ ! -f "${LIBERO_DIR}/libero/__init__.py" ]]; then
+    echo "# Placeholder so find_packages() discovers libero.* (LIBERO repo is missing this)." \
+        > "${LIBERO_DIR}/libero/__init__.py"
+    log "Created ${LIBERO_DIR}/libero/__init__.py"
+fi
+
+# uv pip sync into the LIBERO venv (note: VIRTUAL_ENV targets that venv explicitly,
 # so we don't need to `activate`). cu113 index supplies the old torch wheels.
 VIRTUAL_ENV="${LIBERO_VENV}" uv pip sync \
     "${REPO_DIR}/examples/libero/requirements.txt" \
@@ -199,14 +209,6 @@ VIRTUAL_ENV="${LIBERO_VENV}" uv pip sync \
 
 VIRTUAL_ENV="${LIBERO_VENV}" uv pip install -e "${REPO_DIR}/packages/openpi-client"
 VIRTUAL_ENV="${LIBERO_VENV}" uv pip install -e "${LIBERO_DIR}"
-
-# Defensive: LIBERO's repo is sometimes missing this __init__.py, which makes
-# find_packages() register nothing and `import libero` fail silently. Harmless if present.
-if [[ ! -f "${LIBERO_DIR}/libero/__init__.py" ]]; then
-    echo "# Placeholder so find_packages() discovers libero.* (LIBERO repo is missing this)." \
-        > "${LIBERO_DIR}/libero/__init__.py"
-    log "Created ${LIBERO_DIR}/libero/__init__.py"
-fi
 
 log "LIBERO env ready at ${LIBERO_VENV}"
 
