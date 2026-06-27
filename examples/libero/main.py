@@ -47,6 +47,7 @@ class Args:
     save_name: str = "debug" # Folder name to save meta information
 
     seed: int = 7  # Random Seed (for reproducibility)
+    overwrite: bool = False  # If False, resume by skipping rollouts whose record already exists; if True, re-run them
 
 
 def eval_libero(args: Args) -> None:
@@ -96,6 +97,16 @@ def eval_libero(args: Args) -> None:
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+            # Resume support: skip this rollout if its record already exists (any success value).
+            # The meta .pkl is written last, so its presence marks a fully-completed episode, and
+            # the server only records what the client queries -- so skipped episodes leave no
+            # orphaned policy_records. Pass --args.overwrite to force a re-run.
+            if not args.overwrite and any(
+                save_folder.glob(f"task{task_id}--ep{episode_idx}--succ*.pkl")
+            ):
+                logging.info(f"Skipping task {task_id} episode {episode_idx}: record already exists.")
+                continue
+
             logging.info(f"\nTask: {task_description}")
 
             # Reset environment
@@ -107,6 +118,7 @@ def eval_libero(args: Args) -> None:
 
             # Setup
             t = 0
+            done = False  # ensure it's defined even if an exception fires before the first env.step
             replay_images = []
             replay_wrist_images = []
             step_done = []
@@ -227,14 +239,17 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
-        # Log final results
-        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        # Log final results (guard against tasks fully skipped on resume -> denominators of 0)
+        if task_episodes:
+            logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+        if total_episodes:
+            logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
         env.close()
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
-    logging.info(f"Total episodes: {total_episodes}")
+    if total_episodes:
+        logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    logging.info(f"Total episodes: {total_episodes} (newly run this invocation)")
 
 
 def _get_libero_env(task, resolution, seed):
