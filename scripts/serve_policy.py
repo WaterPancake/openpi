@@ -51,6 +51,11 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
     record_save_image: bool = False
+    # Store large recorded feature arrays (hidden_states/pre_velocity) as bfloat16 instead of float32 (halves disk).
+    record_bf16: bool = True
+    # Also save the post-final-norm "pre_velocity" feature. Off by default since it is ~recoverable from
+    # hidden_states[-1] + the final RMSNorm; enable to keep the exact feature SAFE feeds to the velocity head.
+    record_pre_velocity: bool = False
     save_name: str = "debug"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
@@ -115,9 +120,11 @@ def main(args: Args) -> None:
     # Record the policy's behavior.
     if args.record:
         policy = _policy.PolicyRecorder(
-            policy, 
+            policy,
             f"rollouts/{args.save_name}/policy_records",
             args.record_save_image,
+            bf16=args.record_bf16,
+            save_pre_velocity=args.record_pre_velocity,
         )
 
     hostname = socket.gethostname()

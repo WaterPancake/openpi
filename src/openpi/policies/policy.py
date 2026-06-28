@@ -10,6 +10,7 @@ import flax
 import flax.traverse_util
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 from openpi_client import base_policy as _base_policy
 from typing_extensions import override
@@ -125,11 +126,16 @@ class Policy(BasePolicy):
 class PolicyRecorder(_base_policy.BasePolicy):
     """Records the policy's behavior to disk."""
 
+    # Large float feature arrays that the bf16 toggle applies to.
+    _FEATURE_KEYS = ("hidden_states", "pre_velocity")
+
     def __init__(
-        self, 
-        policy: _base_policy.BasePolicy, 
+        self,
+        policy: _base_policy.BasePolicy,
         record_dir: str,
         save_images: bool = False,
+        bf16: bool = True,
+        save_pre_velocity: bool = False,
     ):
         self._policy = policy
 
@@ -138,6 +144,11 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_dir.mkdir(parents=True, exist_ok=True)
         self._record_step = 0
         self._save_images = save_images
+        # Store large feature arrays as bfloat16 instead of float32 (halves disk).
+        self._bf16 = bf16
+        # Whether to keep the post-final-norm "pre_velocity" feature. It is ~recoverable from
+        # hidden_states[-1] + the final RMSNorm, so it is dropped by default to save space.
+        self._save_pre_velocity = save_pre_velocity
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
@@ -179,6 +190,18 @@ class PolicyRecorder(_base_policy.BasePolicy):
                 
         # Save the output to meta
         meta_to_save.update(results)
+
+        # Optionally drop the post-final-norm "pre_velocity" feature (recoverable from
+        # hidden_states[-1] + the final RMSNorm).
+        if not self._save_pre_velocity:
+            meta_to_save.pop("pre_velocity", None)
+
+        # Optionally downcast the large feature arrays to bfloat16 to halve on-disk size.
+        # (Reading these back requires ml_dtypes, which ships as a JAX dependency.)
+        if self._bf16:
+            for k in self._FEATURE_KEYS:
+                if k in meta_to_save:
+                    meta_to_save[k] = np.asarray(meta_to_save[k]).astype(ml_dtypes.bfloat16)
 
         # Handle the pi0-fast intermediate outputs
         if "logits" in meta_to_save:
